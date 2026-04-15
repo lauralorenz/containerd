@@ -188,6 +188,10 @@ func TestImport(t *testing.T) {
 			t.Fatalf("unexpected layer hash %s, expected %s", m.Layers[0].Digest, d1)
 		}
 
+		if ref := m.Annotations[ocispec.AnnotationRefName]; ref == "" {
+			t.Fatalf("expected annotation %s to be set", ocispec.AnnotationRefName)
+		}
+
 		if expManifest != nil {
 			if !reflect.DeepEqual(m.Layers, expManifest.Layers) {
 				t.Fatalf("DeepEqual on Layers failed: %v vs. %v", m.Layers, expManifest.Layers)
@@ -279,6 +283,29 @@ func TestImport(t *testing.T) {
 				tc.File("e95212f7aa2cab51d0abd765cd43.json", badConfig, 0644),
 				tc.File("manifest.json", []byte(`[{"Config":"e95212f7aa2cab51d0abd765cd43.json","RepoTags":["test-import:notlatest", "another/repo:tag"],"Layers":["bd765cd43e95212f7aa2cab51d0a/layer.tar"]}]`), 0644),
 			),
+		},
+		{
+			Name: "DockerV2.1-bydigest",
+			Writer: tartest.TarAll(
+				tc.Dir("bd765cd43e95212f7aa2cab51d0a", 0755),
+				tc.File("bd765cd43e95212f7aa2cab51d0a/json", empty, 0644),
+				tc.File("bd765cd43e95212f7aa2cab51d0a/layer.tar", b1, 0644),
+				tc.File("bd765cd43e95212f7aa2cab51d0a/VERSION", version, 0644),
+				tc.File("e95212f7aa2cab51d0abd765cd43.json", c1, 0644),
+				tc.File("manifest.json", []byte(`[{"Config":"e95212f7aa2cab51d0abd765cd43.json","RepoTags":["test-import@sha256:4d58116e927f57ae928de08139577b90232942c5f725dca450d5a10d4d13da69"],"Layers":["bd765cd43e95212f7aa2cab51d0a/layer.tar"]}]`), 0644),
+			),
+			Check: func(ctx context.Context, t *testing.T, client *Client, imgs []images.Image) {
+				if len(imgs) == 0 {
+					t.Fatalf("no images")
+				}
+
+				names := []string{
+					"docker.io/library/test-import@sha256:4d58116e927f57ae928de08139577b90232942c5f725dca450d5a10d4d13da69",
+				}
+
+				checkImages(t, imgs[0].Target.Digest, imgs, names...)
+				checkManifest(ctx, t, client.ContentStore(), imgs[0].Target, nil)
+			},
 		},
 		{
 			Name: "OCI-BadFormat",
@@ -529,6 +556,9 @@ func createManifest(config []byte, layers [][]byte) ([]byte, digest.Digest, *oci
 			Annotations: map[string]string{
 				"ocispec": "manifest.config.descriptor",
 			},
+		},
+		Annotations: map[string]string{
+			ocispec.AnnotationRefName: "test",
 		},
 	}
 	for _, l := range layers {
