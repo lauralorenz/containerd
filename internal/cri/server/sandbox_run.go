@@ -122,6 +122,16 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	sandboxInfo.Runtime.Name = ociRuntime.Type
 	sandboxInfo.Sandboxer = ociRuntime.Sandboxer
 
+	span.SetAttributes(
+		tracing.Attribute("pod.namespace", metadata.GetNamespace()),
+		tracing.Attribute("pod.name", metadata.GetName()),
+		tracing.Attribute("pod.uid", metadata.GetUid()),
+		tracing.Attribute("pod.attempt", metadata.GetAttempt()),
+		tracing.Attribute("runtime.handler", r.GetRuntimeHandler()),
+		tracing.Attribute("runtime.type", ociRuntime.Type),
+		tracing.Attribute("sandboxer", ociRuntime.Sandboxer),
+	)
+
 	runtimeStart := time.Now()
 	// Retrieve runtime options
 	runtimeOpts, err := criconfig.GenerateRuntimeOptions(ociRuntime)
@@ -205,6 +215,10 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 			netnsMountDir = filepath.Join(c.config.StateDir, "netns")
 		}
 
+		netnsCtx, netnsSpan := tracing.StartSpan(ctx, tracing.Name("cri", "sandbox", "netns_create"),
+			tracing.WithNamespace(ctx),
+			tracing.WithAttribute("sandbox.id", id),
+		)
 		if !userNsEnabled {
 			sandbox.NetNS, err = netns.NewNetNS(netnsMountDir)
 		} else {
@@ -212,8 +226,13 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 			sandbox.NetNS, err = c.setupNetnsWithinUserns(netnsMountDir, usernsOpts)
 		}
 		if err != nil {
+			netnsSpan.RecordError(err)
+			netnsSpan.End()
 			return nil, fmt.Errorf("failed to create network namespace for sandbox %q: %w", id, err)
 		}
+		netnsSpan.SetAttributes(tracing.Attribute("netns.path", sandbox.NetNS.GetPath()))
+		netnsSpan.End()
+		_ = netnsCtx
 		// Update network namespace in the store, which is used to generate the container's spec
 		sandbox.NetNSPath = sandbox.NetNS.GetPath()
 		defer func() {
@@ -278,9 +297,18 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		}
 	}
 
-	if err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath)); err != nil {
+	createCtx, createSpan := tracing.StartSpan(ctx, tracing.Name("cri", "sandbox", "create"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", id),
+		tracing.WithAttribute("sandboxer", sandbox.Sandboxer),
+	)
+	err = c.sandboxService.CreateSandbox(createCtx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath))
+	if err != nil {
+		createSpan.RecordError(err)
+		createSpan.End()
 		return nil, fmt.Errorf("failed to create sandbox %q: %w", id, err)
 	}
+	createSpan.End()
 
 	// HACK: Ensure pause container image is present before starting the sandbox.
 	// Ideally, this should be called from the sandbox implementation itself, but it's
@@ -296,16 +324,32 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// Runtimes set disable_pause_image_pull = true to tell the CRI layer that they manage
 	// pause image availability on their own (e.g. shim sandboxers).
 	if !ociRuntime.DisablePauseImagePull {
-		if err := c.ensurePauseImageExists(ctx, r.GetConfig(), r.GetRuntimeHandler()); err != nil {
+		pauseCtx, pauseSpan := tracing.StartSpan(ctx, tracing.Name("cri", "sandbox", "ensure_pause_image"),
+			tracing.WithNamespace(ctx),
+			tracing.WithAttribute("sandbox.id", id),
+			tracing.WithAttribute("runtime.handler", r.GetRuntimeHandler()),
+		)
+		err := c.ensurePauseImageExists(pauseCtx, r.GetConfig(), r.GetRuntimeHandler())
+		if err != nil {
+			pauseSpan.RecordError(err)
+			pauseSpan.End()
 			return nil, err
 		}
+		pauseSpan.End()
 	} else {
 		log.G(ctx).Debugf("Skipping pause image pull for runtime handler %q (type=%q, sandboxer=%q, disable_pause_image_pull=true)",
 			r.GetRuntimeHandler(), ociRuntime.Type, ociRuntime.Sandboxer)
 	}
 
-	ctrl, err := c.sandboxService.StartSandbox(ctx, sandbox.Sandboxer, id)
+	startCtx, startSpan := tracing.StartSpan(ctx, tracing.Name("cri", "sandbox", "start"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", id),
+		tracing.WithAttribute("sandboxer", sandbox.Sandboxer),
+	)
+	ctrl, err := c.sandboxService.StartSandbox(startCtx, sandbox.Sandboxer, id)
 	if err != nil {
+		startSpan.RecordError(err)
+		startSpan.End()
 		var cerr podsandbox.CleanupErr
 		if errors.As(err, &cerr) {
 			cleanupErr = fmt.Errorf("failed to cleanup sandbox: %w", cerr)
@@ -319,6 +363,10 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		}
 		return nil, fmt.Errorf("failed to start sandbox %q: %w", id, err)
 	}
+	if ctrl.Address != "" {
+		startSpan.SetAttributes(tracing.Attribute("sandbox.address", ctrl.Address))
+	}
+	startSpan.End()
 
 	// Shutdown the sandbox if we fail before adding it to store.
 	rollbackSandbox := true
@@ -361,10 +409,17 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 	defer c.nri.BlockPluginSync().Unblock()
 
-	err = c.nri.RunPodSandbox(ctx, &sandbox)
+	nriCtx, nriSpan := tracing.StartSpan(ctx, tracing.Name("cri", "sandbox", "nri"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", id),
+	)
+	err = c.nri.RunPodSandbox(nriCtx, &sandbox)
 	if err != nil {
+		nriSpan.RecordError(err)
+		nriSpan.End()
 		return nil, fmt.Errorf("NRI RunPodSandbox failed: %w", err)
 	}
+	nriSpan.End()
 
 	defer func() {
 		if retErr != nil {
