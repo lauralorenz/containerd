@@ -34,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	google_protobuf "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/stdio"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/fifo"
 	runc "github.com/containerd/go-runc"
 	"github.com/containerd/log"
@@ -121,9 +122,15 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (retError error) {
 		}
 		defer socket.Close()
 	} else {
-		if pio, err = createIO(ctx, p.id, p.IoUID, p.IoGID, p.stdio); err != nil {
+		ioCtx, ioSpan := tracing.StartSpan(ctx, "shim.create_io",
+			tracing.WithAttribute("container.id", p.id),
+		)
+		if pio, err = createIO(ioCtx, p.id, p.IoUID, p.IoGID, p.stdio); err != nil {
+			ioSpan.RecordError(err)
+			ioSpan.End()
 			return fmt.Errorf("failed to create init process I/O: %w", err)
 		}
+		ioSpan.End()
 		p.io = pio
 		defer func() {
 			if retError != nil && p.io != nil {
@@ -146,9 +153,16 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (retError error) {
 		opts.ConsoleSocket = socket
 	}
 
-	if err := p.runtime.Create(ctx, r.ID, r.Bundle, opts); err != nil {
+	runcCreateCtx, runcCreateSpan := tracing.StartSpan(ctx, "shim.runc_create",
+		tracing.WithAttribute("container.id", r.ID),
+		tracing.WithAttribute("bundle", r.Bundle),
+	)
+	if err := p.runtime.Create(runcCreateCtx, r.ID, r.Bundle, opts); err != nil {
+		runcCreateSpan.RecordError(err)
+		runcCreateSpan.End()
 		return p.runtimeError(err, "OCI runtime create failed")
 	}
+	runcCreateSpan.End()
 	if r.Stdin != "" {
 		if err := p.openStdin(r.Stdin); err != nil {
 			return err
@@ -270,8 +284,17 @@ func (p *Init) Start(ctx context.Context) error {
 }
 
 func (p *Init) start(ctx context.Context) error {
-	err := p.runtime.Start(ctx, p.id)
-	return p.runtimeError(err, "OCI runtime start failed")
+	startCtx, startSpan := tracing.StartSpan(ctx, "shim.runc_start",
+		tracing.WithAttribute("container.id", p.id),
+	)
+	err := p.runtime.Start(startCtx, p.id)
+	if err != nil {
+		startSpan.RecordError(err)
+		startSpan.End()
+		return p.runtimeError(err, "OCI runtime start failed")
+	}
+	startSpan.End()
+	return nil
 }
 
 // SetExited of the init process with the next status

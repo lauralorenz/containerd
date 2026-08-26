@@ -28,7 +28,7 @@ import (
 // PR #12299: set a default service name for the shim when tracing is active if unset.
 // Ref: https://github.com/containerd/containerd/pull/12299
 func init() {
-	if os.Getenv("OTEL_SERVICE_NAME") == "" {
+	if os.Getenv("OTEL_SERVICE_NAME") == "" || os.Getenv("OTEL_SERVICE_NAME") == "containerd" {
 		os.Setenv("OTEL_SERVICE_NAME", "containerd-shim-runc-v2")
 	}
 }

@@ -48,6 +48,7 @@ import (
 	"github.com/containerd/containerd/v2/core/runtime"
 	oomv2 "github.com/containerd/containerd/v2/internal/oom"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/pkg/oom"
 	oomv1 "github.com/containerd/containerd/v2/pkg/oom/v1"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
@@ -241,6 +242,17 @@ func (s *service) preStart(c *runc.Container) (handleStarted func(*runc.Containe
 
 // Create a new initial process and container with the underlying OCI runtime
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *taskAPI.CreateTaskResponse, err error) {
+	ctx, span := tracing.StartSpan(ctx, "shim.service.Create",
+		tracing.WithAttribute("container.id", r.ID),
+		tracing.WithAttribute("bundle", r.Bundle),
+	)
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+		}
+	}()
+
 	s.lifecycleMu.Lock()
 	handleStarted, cleanup := s.preStart(nil)
 	s.lifecycleMu.Unlock()
@@ -272,29 +284,33 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	// After runc.Create(init), the container’s cgroup contains a paused init process.
 	// Therefore, we should start monitoring OOM events immediately after creation, in
 	// case the process goes OOM very quickly. Otherwise, we may encounter flaky cases
+	oomCtx, oomSpan := tracing.StartSpan(ctx, "shim.oom_monitor_setup",
+		tracing.WithAttribute("container.id", container.ID),
+	)
 	switch cg := container.Cgroup().(type) {
 	case cgroup1.Cgroup:
 		if err := s.cg1oom.Add(container.ID, cg); err != nil {
-			log.G(ctx).WithError(err).Error("add cg to OOM monitor")
+			log.G(oomCtx).WithError(err).Error("add cg to OOM monitor")
 		}
 	case *cgroupsv2.Manager:
 		allControllers, err := cg.RootControllers()
 		if err != nil {
-			log.G(ctx).WithError(err).Error("failed to get root controllers")
+			log.G(oomCtx).WithError(err).Error("failed to get root controllers")
 		} else {
 			if err := cg.ToggleControllers(allControllers, cgroupsv2.Enable); err != nil {
 				if userns.RunningInUserNS() {
-					log.G(ctx).WithError(err).Debugf("failed to enable controllers (%v)", allControllers)
+					log.G(oomCtx).WithError(err).Debugf("failed to enable controllers (%v)", allControllers)
 				} else {
-					log.G(ctx).WithError(err).Errorf("failed to enable controllers (%v)", allControllers)
+					log.G(oomCtx).WithError(err).Errorf("failed to enable controllers (%v)", allControllers)
 				}
 			}
 		}
 
 		if err := s.cg2oom.Add(container.ID, container.Pid(), s.oomEvent); err != nil {
-			log.G(ctx).WithError(err).WithField("container_id", container.ID).Error("failed to watch oom events")
+			log.G(oomCtx).WithError(err).WithField("container_id", container.ID).Error("failed to watch oom events")
 		}
 	}
+	oomSpan.End()
 
 	// The following line cannot return an error as the only state in which that
 	// could happen would also cause the container.Pid() call above to
@@ -313,7 +329,18 @@ func (s *service) RegisterTTRPC(server *ttrpc.Server) error {
 }
 
 // Start a process
-func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
+func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (_ *taskAPI.StartResponse, err error) {
+	ctx, span := tracing.StartSpan(ctx, "shim.service.Start",
+		tracing.WithAttribute("container.id", r.ID),
+		tracing.WithAttribute("exec.id", r.ExecID),
+	)
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+		}
+	}()
+
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err

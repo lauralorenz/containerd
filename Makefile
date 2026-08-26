@@ -97,7 +97,7 @@ ifneq ($(STATIC),)
 	GO_BUILDTAGS += osusergo netgo static_build
 endif
 
-SHIM_GO_BUILDTAGS := $(GO_BUILDTAGS) no_grpc
+SHIM_GO_BUILDTAGS := $(GO_BUILDTAGS) no_grpc shim_tracing
 
 GO_TAGS=$(if $(GO_BUILDTAGS),-tags "$(strip $(GO_BUILDTAGS))",)
 SHIM_GO_TAGS=$(if $(SHIM_GO_BUILDTAGS),-tags "$(strip $(SHIM_GO_BUILDTAGS))",)
