@@ -48,13 +48,26 @@ const checkpointRestoreDir = "ctrd-restore"
 
 // StartContainer starts the container.
 func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContainerRequest) (retRes *runtime.StartContainerResponse, retErr error) {
-	span := tracing.SpanFromContext(ctx)
+	ctx, span := tracing.StartSpan(ctx, tracing.Name("cri", "container", "start"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("container.id", r.GetContainerId()),
+	)
+	defer span.End()
+	defer func() {
+		if retErr != nil {
+			span.RecordError(retErr)
+		}
+	}()
+
 	start := time.Now()
 	cntr, err := c.containerStore.Get(r.GetContainerId())
 	if err != nil {
 		return nil, fmt.Errorf("an error occurred when try to find container %q: %w", r.GetContainerId(), err)
 	}
-	span.SetAttributes(tracing.Attribute("container.id", cntr.ID))
+	span.SetAttributes(
+		tracing.Attribute("container.id", cntr.ID),
+		tracing.Attribute("container.name", cntr.Metadata.Name),
+	)
 	info, err := cntr.Container.Info(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get container info: %w", err)
@@ -98,7 +111,12 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 	if sandbox.Status.Get().State != sandboxstore.StateReady {
 		return nil, fmt.Errorf("sandbox container %q is not running", sandboxID)
 	}
-	span.SetAttributes(tracing.Attribute("sandbox.id", sandboxID))
+	span.SetAttributes(
+		tracing.Attribute("sandbox.id", sandboxID),
+		tracing.Attribute("sandbox.name", sandbox.Metadata.Name),
+		tracing.Attribute("pod.namespace", sandbox.Metadata.Config.GetMetadata().GetNamespace()),
+		tracing.Attribute("pod.name", sandbox.Metadata.Config.GetMetadata().GetName()),
+	)
 
 	ioCreation := func(id string) (_ containerdio.IO, err error) {
 		stdoutWC, stderrWC, err := c.createContainerLoggers(meta.LogPath, config.GetTty())
@@ -203,10 +221,20 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 	}
 	taskOpts = append(taskOpts, ioOwnerTaskOpts...)
 
-	task, err := container.NewTask(ctx, ioCreation, taskOpts...)
+	newTaskCtx, newTaskSpan := tracing.StartSpan(ctx, tracing.Name("cri", "container", "new_task"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("container.id", id),
+		tracing.WithAttribute("sandbox.id", sandboxID),
+	)
+	task, err := container.NewTask(newTaskCtx, ioCreation, taskOpts...)
 	if err != nil {
+		newTaskSpan.RecordError(err)
+		newTaskSpan.End()
 		return nil, fmt.Errorf("failed to create containerd task: %w", err)
 	}
+	newTaskSpan.SetAttributes(tracing.Attribute("task.pid", task.Pid()))
+	newTaskSpan.End()
+
 	defer func() {
 		if retErr != nil {
 			deferCtx, deferCancel := ctrdutil.DeferContext()
@@ -237,16 +265,33 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		}
 	}()
 
-	err = c.nri.StartContainer(ctx, &sandbox, &cntr)
+	nriStartCtx, nriStartSpan := tracing.StartSpan(ctx, tracing.Name("cri", "container", "nri_start"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("container.id", id),
+		tracing.WithAttribute("sandbox.id", sandboxID),
+	)
+	err = c.nri.StartContainer(nriStartCtx, &sandbox, &cntr)
 	if err != nil {
+		nriStartSpan.RecordError(err)
+		nriStartSpan.End()
 		log.G(ctx).WithError(err).Errorf("NRI container start failed")
 		return nil, fmt.Errorf("NRI container start failed: %w", err)
 	}
+	nriStartSpan.End()
 
+	taskStartCtx, taskStartSpan := tracing.StartSpan(ctx, tracing.Name("cri", "container", "task_start"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("container.id", id),
+		tracing.WithAttribute("sandbox.id", sandboxID),
+	)
 	// Start containerd task.
-	if err := task.Start(ctx); err != nil {
+	if err := task.Start(taskStartCtx); err != nil {
+		taskStartSpan.RecordError(err)
+		taskStartSpan.End()
 		return nil, fmt.Errorf("failed to start containerd task %q: %w", id, err)
 	}
+	taskStartSpan.SetAttributes(tracing.Attribute("task.pid", task.Pid()))
+	taskStartSpan.End()
 
 	// Update container start timestamp.
 	if err := cntr.Status.UpdateSync(func(status containerstore.Status) (containerstore.Status, error) {
@@ -262,13 +307,21 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 
 	c.generateAndSendContainerEvent(ctx, id, sandboxID, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
 
-	err = c.nri.PostStartContainer(ctx, &sandbox, &cntr)
+	nriPostCtx, nriPostSpan := tracing.StartSpan(ctx, tracing.Name("cri", "container", "nri_post_start"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("container.id", id),
+		tracing.WithAttribute("sandbox.id", sandboxID),
+	)
+	err = c.nri.PostStartContainer(nriPostCtx, &sandbox, &cntr)
 	if err != nil {
+		nriPostSpan.RecordError(err)
 		log.G(ctx).WithError(err).Errorf("NRI post-start notification failed")
 	}
+	nriPostSpan.End()
 
 	containerStartTimer.WithValues(info.Runtime.Name).UpdateSince(start)
 
+	span.SetAttributes(tracing.Attribute("task.pid", task.Pid()))
 	span.AddEvent("container started",
 		tracing.Attribute("container.start.duration", time.Since(start).String()),
 	)

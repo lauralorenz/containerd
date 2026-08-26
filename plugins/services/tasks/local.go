@@ -58,6 +58,7 @@ import (
 	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/rdt"
 	"github.com/containerd/containerd/v2/pkg/timeout"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
@@ -293,23 +294,45 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 }
 
 func (l *local) Start(ctx context.Context, r *api.StartRequest, _ ...grpc.CallOption) (*api.StartResponse, error) {
+	ctx, span := tracing.StartSpan(ctx, tracing.Name("tasks.service", "Start"),
+		tracing.WithAttribute("container.id", r.ContainerID),
+		tracing.WithAttribute("exec.id", r.ExecID),
+		tracing.WithNamespace(ctx),
+	)
+	defer span.End()
+
 	t, err := l.getTask(ctx, r.ContainerID)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 	p := runtime.Process(t)
 	if r.ExecID != "" {
 		if p, err = t.Process(ctx, r.ExecID); err != nil {
+			span.RecordError(err)
 			return nil, errgrpc.ToGRPC(err)
 		}
 	}
-	if err := p.Start(ctx); err != nil {
+
+	shimCtx, shimSpan := tracing.StartSpan(ctx, tracing.Name("tasks.shim", "Start"),
+		tracing.WithAttribute("container.id", r.ContainerID),
+		tracing.WithAttribute("exec.id", r.ExecID),
+		tracing.WithNamespace(ctx),
+	)
+	if err := p.Start(shimCtx); err != nil {
+		shimSpan.RecordError(err)
+		shimSpan.End()
+		span.RecordError(err)
 		return nil, errgrpc.ToGRPC(err)
 	}
+	shimSpan.End()
+
 	state, err := p.State(ctx)
 	if err != nil {
+		span.RecordError(err)
 		return nil, errgrpc.ToGRPC(err)
 	}
+	span.SetAttributes(tracing.Attribute("task.pid", state.Pid))
 	return &api.StartResponse{
 		Pid: state.Pid,
 	}, nil

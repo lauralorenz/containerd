@@ -253,16 +253,26 @@ func (t *task) Start(ctx context.Context) error {
 	)
 	defer span.End()
 
-	r, err := t.client.TaskService().Start(ctx, &tasks.StartRequest{
+	rpcCtx, rpcSpan := tracing.StartSpan(ctx, tracing.Name("client.task", "StartRPC"),
+		tracing.WithAttribute("task.id", t.ID()),
+		tracing.WithNamespace(ctx),
+	)
+	r, err := t.client.TaskService().Start(rpcCtx, &tasks.StartRequest{
 		ContainerID: t.id,
 	})
 	if err != nil {
+		rpcSpan.RecordError(err)
+		rpcSpan.End()
 		if t.io != nil {
 			t.io.Cancel()
 			t.io.Close()
 		}
+		span.RecordError(err)
 		return errgrpc.ToNative(err)
 	}
+	rpcSpan.SetAttributes(tracing.Attribute("task.pid", r.Pid))
+	rpcSpan.End()
+
 	span.SetAttributes(tracing.Attribute("task.pid", r.Pid))
 	t.pid = r.Pid
 	return nil
