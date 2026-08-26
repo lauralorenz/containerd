@@ -33,7 +33,12 @@ import (
 // StopPodSandbox stops the sandbox. If there are any running containers in the
 // sandbox, they should be forcibly terminated.
 func (c *criService) StopPodSandbox(ctx context.Context, r *runtime.StopPodSandboxRequest) (*runtime.StopPodSandboxResponse, error) {
-	span := tracing.SpanFromContext(ctx)
+	ctx, span := tracing.StartSpan(ctx, tracing.Name("cri", "sandbox", "stop"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", r.GetPodSandboxId()),
+	)
+	defer span.End()
+
 	sandbox, err := c.sandboxStore.Get(r.GetPodSandboxId())
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
@@ -49,8 +54,13 @@ func (c *criService) StopPodSandbox(ctx context.Context, r *runtime.StopPodSandb
 
 	defer c.nri.BlockPluginSync().Unblock()
 
-	span.SetAttributes(tracing.Attribute("sandbox.id", sandbox.ID))
+	span.SetAttributes(
+		tracing.Attribute("sandbox.id", sandbox.ID),
+		tracing.Attribute("sandbox.name", sandbox.Metadata.Name),
+		tracing.Attribute("runtime.handler", sandbox.RuntimeHandler),
+	)
 	if err := c.stopPodSandbox(ctx, sandbox); err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
@@ -120,9 +130,20 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 			}
 			log.G(ctx).WithError(err).Warnf("failed to destroy network for sandbox %q; and ignoring because the sandbox network setup result is nil indicating the network setup never completed", id)
 		}
+
+		netnsRmCtx, netnsRmSpan := tracing.StartSpan(ctx, tracing.Name("cni", "netns_remove"),
+			tracing.WithNamespace(ctx),
+			tracing.WithAttribute("sandbox.id", id),
+			tracing.WithAttribute("netns.path", sandbox.NetNSPath),
+		)
 		if err := sandbox.NetNS.Remove(); err != nil {
+			netnsRmSpan.RecordError(err)
+			netnsRmSpan.End()
 			return fmt.Errorf("failed to remove network namespace for sandbox %q: %w", id, err)
 		}
+		netnsRmSpan.End()
+		_ = netnsRmCtx
+
 		sandboxDeleteNetwork.UpdateSince(netStop)
 
 		span.AddEvent("finished pod network teardown",
@@ -151,7 +172,20 @@ func (c *criService) waitSandboxStop(ctx context.Context, sandbox sandboxstore.S
 }
 
 // teardownPodNetwork removes the network from the pod
-func (c *criService) teardownPodNetwork(ctx context.Context, sandbox sandboxstore.Sandbox) error {
+func (c *criService) teardownPodNetwork(ctx context.Context, sandbox sandboxstore.Sandbox) (retErr error) {
+	ctx, span := tracing.StartSpan(ctx, tracing.Name("cni", "teardown_pod_network"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", sandbox.ID),
+		tracing.WithAttribute("netns.path", sandbox.NetNSPath),
+		tracing.WithAttribute("runtime.handler", sandbox.RuntimeHandler),
+	)
+	defer span.End()
+	defer func() {
+		if retErr != nil {
+			span.RecordError(retErr)
+		}
+	}()
+
 	netPlugin := c.getNetworkPlugin(sandbox.RuntimeHandler)
 	if netPlugin == nil {
 		return errors.New("cni config not initialized")
@@ -167,13 +201,21 @@ func (c *criService) teardownPodNetwork(ctx context.Context, sandbox sandboxstor
 		return fmt.Errorf("get cni namespace options: %w", err)
 	}
 
+	pluginCtx, pluginSpan := tracing.StartSpan(ctx, tracing.Name("cni", "plugin_remove"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", id),
+		tracing.WithAttribute("netns.path", path),
+	)
 	netStart := time.Now()
-	err = netPlugin.Remove(ctx, id, path, opts...)
+	err = netPlugin.Remove(pluginCtx, id, path, opts...)
 	networkPluginOperations.WithValues(networkTearDownOp).Inc()
 	networkPluginOperationsLatency.WithValues(networkTearDownOp).UpdateSince(netStart)
 	if err != nil {
+		pluginSpan.RecordError(err)
+		pluginSpan.End()
 		networkPluginOperationsErrors.WithValues(networkTearDownOp).Inc()
 		return err
 	}
+	pluginSpan.End()
 	return nil
 }

@@ -540,10 +540,18 @@ func (c *criService) setupPodNetwork(ctx context.Context, sandbox *sandboxstore.
 		return errors.New("cni config not initialized")
 	}
 	if c.config.UseInternalLoopback {
+		lbCtx, lbSpan := tracing.StartSpan(ctx, tracing.Name("cni", "loopback_up"),
+			tracing.WithNamespace(ctx),
+			tracing.WithAttribute("netns.path", path),
+		)
 		err := c.bringUpLoopback(path)
 		if err != nil {
+			lbSpan.RecordError(err)
+			lbSpan.End()
 			return fmt.Errorf("unable to set lo to up: %w", err)
 		}
+		lbSpan.End()
+		_ = lbCtx
 	}
 	opts, err := cniNamespaceOpts(id, config)
 	if err != nil {
@@ -552,18 +560,31 @@ func (c *criService) setupPodNetwork(ctx context.Context, sandbox *sandboxstore.
 	log.G(ctx).WithField("podsandboxid", id).Debugf("begin cni setup")
 	netStart := time.Now()
 
+	pluginCtx, pluginSpan := tracing.StartSpan(ctx, tracing.Name("cni", "plugin_setup"),
+		tracing.WithNamespace(ctx),
+		tracing.WithAttribute("sandbox.id", id),
+		tracing.WithAttribute("netns.path", path),
+		tracing.WithAttribute("cni.setup_serially", c.config.CniConfig.NetworkPluginSetupSerially),
+	)
 	span.AddEvent("cni.setup.start")
 	if c.config.CniConfig.NetworkPluginSetupSerially {
-		result, err = netPlugin.SetupSerially(ctx, id, path, opts...)
+		result, err = netPlugin.SetupSerially(pluginCtx, id, path, opts...)
 	} else {
-		result, err = netPlugin.Setup(ctx, id, path, opts...)
+		result, err = netPlugin.Setup(pluginCtx, id, path, opts...)
 	}
 	networkPluginOperations.WithValues(networkSetUpOp).Inc()
 	networkPluginOperationsLatency.WithValues(networkSetUpOp).UpdateSince(netStart)
 	if err != nil {
+		pluginSpan.RecordError(err)
+		pluginSpan.End()
 		networkPluginOperationsErrors.WithValues(networkSetUpOp).Inc()
 		return err
 	}
+	pluginSpan.SetAttributes(
+		tracing.Attribute("cni.interfaces.count", len(result.Interfaces)),
+		tracing.Attribute("cni.routes.count", len(result.Routes)),
+	)
+	pluginSpan.End()
 
 	span.AddEvent("cni.setup.complete")
 	logDebugCNIResult(ctx, id, result)
