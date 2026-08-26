@@ -23,6 +23,9 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel"
 
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup1"
@@ -100,6 +103,23 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 			return shim.RemoveSocket(address)
 		})
 	}
+	sd.RegisterCallback(func(cbCtx context.Context) error {
+		// PR #12299: flush and shutdown OpenTelemetry tracer provider so short-lived shim spans
+		// are exported before the shim process terminates.
+		// Ref: https://github.com/containerd/containerd/pull/12299
+		if tp := otel.GetTracerProvider(); tp != nil {
+			if shutdowner, ok := tp.(interface{ Shutdown(context.Context) error }); ok {
+				ctx, cancel := context.WithTimeout(cbCtx, 1*time.Second)
+				defer cancel()
+				if err := shutdowner.Shutdown(ctx); err != nil {
+					log.G(cbCtx).WithError(err).Warn("Failed to shutdown tracer provider")
+				}
+			}
+		}
+
+		close(s.events)
+		return nil
+	})
 	return s, nil
 }
 

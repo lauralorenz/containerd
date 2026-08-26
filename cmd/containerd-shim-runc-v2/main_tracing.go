@@ -19,6 +19,16 @@
 package main
 
 import (
+	"os"
+
 	_ "github.com/containerd/containerd/v2/internal/pprof"
 	_ "github.com/containerd/containerd/v2/pkg/tracing/plugin"
 )
+
+// PR #12299: set a default service name for the shim when tracing is active if unset.
+// Ref: https://github.com/containerd/containerd/pull/12299
+func init() {
+	if os.Getenv("OTEL_SERVICE_NAME") == "" {
+		os.Setenv("OTEL_SERVICE_NAME", "containerd-shim-runc-v2")
+	}
+}
